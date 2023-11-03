@@ -1,6 +1,7 @@
+build
 flake8
-nose
 parameterized
-Cython
 k5test
 decorator
+mypy==0.971
+types-decorator

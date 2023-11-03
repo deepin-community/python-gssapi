@@ -1,6 +1,9 @@
 import copy
+import ctypes
+import ctypes.util
 import os
 import socket
+import sys
 import unittest
 
 import gssapi.raw as gb
@@ -12,8 +15,13 @@ from collections.abc import Set
 
 
 TARGET_SERVICE_NAME = b'host'
-FQDN = socket.getfqdn().encode('utf-8')
+FQDN = (
+    'localhost' if sys.platform == 'darwin' else socket.getfqdn()
+).encode('utf-8')
 SERVICE_PRINCIPAL = TARGET_SERVICE_NAME + b'/' + FQDN
+
+if sys.platform == 'darwin':
+    TARGET_SERVICE_NAME += b"@" + FQDN
 
 
 class _GSSAPIKerberosTestCase(kt.KerberosTestCase):
@@ -28,6 +36,7 @@ class _GSSAPIKerberosTestCase(kt.KerberosTestCase):
 
         cls.USER_PRINC = cls.realm.user_princ.split('@')[0].encode("UTF-8")
         cls.ADMIN_PRINC = cls.realm.admin_princ.split('@')[0].encode("UTF-8")
+        cls.KRB5_LIB_PATH = os.environ.get("GSSAPI_KRB5_MAIN_LIB", None)
 
     @classmethod
     def _init_env(cls):
@@ -99,6 +108,7 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
     # doesn't actually implement it
 
     @ktu.gssapi_extension_test('rfc6680', 'RFC 6680')
+    @ktu.krb_provider_test(['mit'], 'Heimdal does not implemented for krb5')
     def test_inquire_name_not_mech_name(self):
         base_name = gb.import_name(TARGET_SERVICE_NAME,
                                    gb.NameType.hostbased_service)
@@ -109,6 +119,7 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         self.assertIsNone(inquire_res.mech)
 
     @ktu.gssapi_extension_test('rfc6680', 'RFC 6680')
+    @ktu.krb_provider_test(['mit'], 'Heimdal does not implemented for krb5')
     def test_inquire_name_mech_name(self):
         base_name = gb.import_name(TARGET_SERVICE_NAME,
                                    gb.NameType.hostbased_service)
@@ -241,7 +252,8 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         creds, actual_mechs, ttl = cred_resp
         self.assertIsInstance(creds, gb.Creds)
         self.assertIn(gb.MechType.kerberos, actual_mechs)
-        self.assertIsInstance(ttl, int)
+        if sys.platform != 'darwin':
+            self.assertIsInstance(ttl, int)
 
         gb.release_name(name)
         gb.release_cred(creds)
@@ -379,7 +391,8 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
 
     @ktu.gssapi_extension_test('s4u', 'S4U')
     @ktu.krb_minversion_test('1.11',
-                             'returning delegated S4U2Proxy credentials')
+                             'returning delegated S4U2Proxy credentials',
+                             provider='mit')
     def test_always_get_delegated_creds(self):
         svc_princ = SERVICE_PRINCIPAL.decode("UTF-8")
         self.realm.kinit(svc_princ, flags=['-k', '-f'])
@@ -421,10 +434,14 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         self.assertIsNotNone(deleg_creds)
 
         store_res = gb.store_cred(deleg_creds, usage='initiate',
+                                  mech=gb.MechType.kerberos,
                                   set_default=True, overwrite=True)
         self.assertIsNotNone(store_res)
-        self.assertEqual(store_res.usage, "initiate")
-        self.assertIn(gb.MechType.kerberos, store_res.mechs)
+
+        if self.realm.provider.lower() != 'heimdal':
+            # Heimdal does not return this info as expected
+            self.assertEqual(store_res.usage, "initiate")
+            self.assertIn(gb.MechType.kerberos, store_res.mechs)
 
         deleg_name = gb.inquire_cred(deleg_creds).name
         acq_resp = gb.acquire_cred(deleg_name, usage='initiate')
@@ -445,9 +462,17 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         initial_creds = gb.acquire_cred(None, usage='initiate').creds
 
         # NB(sross): overwrite because the ccache doesn't exist yet
-        store_res = gb.store_cred_into(store, initial_creds, overwrite=True)
+        expected_usage = 'initiate'
+        store_kwargs = {}
+        if self.realm.provider.lower() == 'heimdal':
+            expected_usage = 'both'
+            store_kwargs['mech'] = gb.MechType.kerberos
+            store_kwargs['usage'] = 'initiate'
+
+        store_res = gb.store_cred_into(store, initial_creds, overwrite=True,
+                                       **store_kwargs)
         self.assertIsNotNone(store_res.mechs)
-        self.assertEqual(store_res.usage, "initiate")
+        self.assertEqual(store_res.usage, expected_usage)
 
         name = gb.import_name(princ_name.encode('UTF-8'))
         retrieve_res = gb.acquire_cred_from(store, name)
@@ -459,6 +484,9 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         self.assertIsInstance(retrieve_res.lifetime, int)
 
     def test_add_cred(self):
+        if sys.platform == 'darwin':
+            self.skipTest('macOS fails to find the credential')
+
         target_name = gb.import_name(TARGET_SERVICE_NAME,
                                      gb.NameType.hostbased_service)
         client_ctx_resp = gb.init_sec_context(target_name)
@@ -494,9 +522,19 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         inq_resp = gb.inquire_cred(cred)
         self.assertIsNotNone(inq_resp)
         self.assertIsInstance(inq_resp.name, gb.Name)
+
+        if self.realm.provider.lower() == 'heimdal':
+            name = gb.import_name(self.realm.host_princ.encode('utf-8'),
+                                  gb.NameType.kerberos_principal)
+
         self.assertTrue(gb.compare_name(name, inq_resp.name))
-        self.assertIsInstance(inq_resp.lifetime, int)
-        self.assertEqual(inq_resp.usage, "both")
+
+        if sys.platform == 'darwin':
+            self.assertEqual(inq_resp.usage, "accept")
+        else:
+            self.assertIsInstance(inq_resp.lifetime, int)
+            self.assertEqual(inq_resp.usage, "both")
+
         self.assertIn(gb.MechType.kerberos, inq_resp.mechs)
 
     def test_create_oid_from_bytes(self):
@@ -542,8 +580,11 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         imp_creds, actual_mechs, output_ttl = imp_resp
         self.assertIsNotNone(imp_creds)
         self.assertIsInstance(imp_creds, gb.Creds)
-        self.assertIn(gb.MechType.kerberos, actual_mechs)
-        self.assertIsInstance(output_ttl, int)
+        if sys.platform == 'darwin':
+            self.assertIn(gb.OID.from_int_seq('1.3.6.1.5.2.5'), actual_mechs)
+        else:
+            self.assertIn(gb.MechType.kerberos, actual_mechs)
+            self.assertIsInstance(output_ttl, int)
 
     @ktu.gssapi_extension_test('password_add', 'Password (add)')
     def test_add_cred_with_password(self):
@@ -566,6 +607,9 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
 
     @ktu.gssapi_extension_test('rfc5587', 'RFC 5587')
     def test_rfc5587(self):
+        if sys.platform == "darwin":
+            self.skipTest("too many edge cases on macOS")
+
         mechs = gb.indicate_mechs_by_attrs(None, None, None)
         self.assertIsInstance(mechs, set)
         self.assertGreater(len(mechs), 0)
@@ -626,25 +670,33 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
             for expected_mech in expected_mechs:
                 self.assertNotIn(expected_mech, mechs)
 
-        for attr, expected_mechs in known_attrs_dict.items():
-            attrs = set([attr])
+        if self.realm.provider.lower() != 'heimdal':
+            # Heimdal doesn't fully implement gss_indicate_mechs_by_attrs
+            for attr, expected_mechs in known_attrs_dict.items():
+                attrs = set([attr])
 
-            mechs = gb.indicate_mechs_by_attrs(None, None, attrs)
-            self.assertGreater(len(mechs), 0)
-            self.assertEqual(mechs, expected_mechs)
+                mechs = gb.indicate_mechs_by_attrs(None, None, attrs)
+                self.assertGreater(len(mechs), 0)
+                self.assertEqual(mechs, expected_mechs)
 
     @ktu.gssapi_extension_test('rfc5587', 'RFC 5587')
     def test_display_mech_attr(self):
         test_attrs = [
             # oid, name, short_desc, long_desc
             # Taken from krb5/src/tests/gssapi/t_saslname
-            [gb.OID.from_int_seq("1.3.6.1.5.5.13.24"), b"GSS_C_MA_CBINDINGS",
-             b"channel-bindings", b"Mechanism supports channel bindings."],
+            [gb.OID.from_int_seq("1.3.6.1.5.5.13.24"),
+                b"GSS_C_MA_CBINDINGS", b"channel-bindings",
+                b"Mechanism supports channel bindings."],
             [gb.OID.from_int_seq("1.3.6.1.5.5.13.1"),
-             b"GSS_C_MA_MECH_CONCRETE", b"concrete-mech",
-             b"Mechanism is neither a pseudo-mechanism nor a composite "
-             b"mechanism."]
+                b"GSS_C_MA_MECH_CONCRETE", b"concrete-mech",
+                b"Mechanism is neither a pseudo-mechanism nor a composite "
+                b"mechanism."]
         ]
+
+        if self.realm.provider.lower() == 'heimdal':
+            test_attrs[0][3] = b""
+            test_attrs[1][3] = b"Indicates that a mech is neither a " \
+                b"pseudo-mechanism nor a composite mechanism"
 
         for attr in test_attrs:
             display_out = gb.display_mech_attr(attr[0])
@@ -660,8 +712,9 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
             out = gb.inquire_saslname_for_mech(mech)
 
             out_smn = out.sasl_mech_name
-            self.assertIsInstance(out_smn, bytes)
-            self.assertGreater(len(out_smn), 0)
+            if out_smn:
+                self.assertIsInstance(out_smn, bytes)
+                self.assertGreater(len(out_smn), 0)
 
             out_mn = out.mech_name
             self.assertIsInstance(out_mn, bytes)
@@ -669,9 +722,16 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
             out_md = out.mech_description
             self.assertIsInstance(out_md, bytes)
 
-            cmp_mech = gb.inquire_mech_for_saslname(out_smn)
-            self.assertIsNotNone(cmp_mech)
-            self.assertEqual(cmp_mech, mech)
+            # Heimdal fails with Unknown mech-code on sanon
+            if not (self.realm.provider.lower() == 'heimdal' and
+                    mech.dotted_form == '1.3.6.1.4.1.5322.26.1.110'):
+                cmp_mech = gb.inquire_mech_for_saslname(out_smn)
+                self.assertIsNotNone(cmp_mech)
+
+                # For some reason macOS sometimes returns this for mechs
+                if not (sys.platform == 'darwin' and
+                        cmp_mech.dotted_form == '1.2.752.43.14.2'):
+                    self.assertEqual(cmp_mech, mech)
 
     @ktu.gssapi_extension_test('rfc4178', 'Negotiation Mechanism')
     def test_set_neg_mechs(self):
@@ -745,7 +805,8 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
     @ktu.krb_minversion_test('1.16',
                              'querying impersonator name of krb5 GSS '
                              'Credential using the '
-                             'GSS_KRB5_GET_CRED_IMPERSONATOR OID')
+                             'GSS_KRB5_GET_CRED_IMPERSONATOR OID',
+                             provider='mit')
     def test_inquire_cred_by_oid_impersonator(self):
         svc_princ = SERVICE_PRINCIPAL.decode("UTF-8")
         self.realm.kinit(svc_princ, flags=['-k', '-f'])
@@ -830,6 +891,9 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
     @ktu.gssapi_extension_test('ggf', 'Global Grid Forum')
     @ktu.gssapi_extension_test('password', 'Add Credential with Password')
     def test_set_sec_context_option(self):
+        if sys.platform == 'darwin':
+            self.skipTest("macOS NTLM does not implement this OID")
+
         ntlm_mech = gb.OID.from_int_seq("1.3.6.1.4.1.311.2.2.10")
         username = gb.import_name(name=b"user",
                                   name_type=gb.NameType.user)
@@ -882,7 +946,7 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
     @ktu.gssapi_extension_test('set_cred_opt', 'Kitten Set Credential Option')
     @ktu.krb_minversion_test('1.14',
                              'GSS_KRB5_CRED_NO_CI_FLAGS_X was added in MIT '
-                             'krb5 1.14')
+                             'krb5 1.14', provider='mit')
     def test_set_cred_option(self):
         name = gb.import_name(SERVICE_PRINCIPAL,
                               gb.NameType.kerberos_principal)
@@ -905,6 +969,345 @@ class TestBaseUtilities(_GSSAPIKerberosTestCase):
         invalid_oid = gb.OID.from_int_seq("1.2.3.4.5.6.7.8.9")
         self.assertRaises(gb.GSSError, gb.set_cred_option, invalid_oid,
                           orig_cred, b"\x00")
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    @ktu.krb_provider_test(['mit'], 'Cannot revert ccache on Heimdal')
+    # https://github.com/heimdal/heimdal/issues/803
+    def test_krb5_ccache_name(self):
+        provider = self.realm.provider.lower()
+
+        new_ccache = os.path.join(self.realm.tmpdir, 'ccache-new')
+        new_env = self.realm.env.copy()
+        new_env['KRB5CCNAME'] = new_ccache
+        self.realm.kinit(self.realm.user_princ,
+                         password=self.realm.password('user'),
+                         env=new_env)
+
+        old_ccache = gb.krb5_ccache_name(new_ccache.encode('utf-8'))
+        try:
+            if provider == 'heimdal':
+                # Heimdal never returns the old name - see above link
+                self.assertTrue(old_ccache is None)
+            else:
+                self.assertEqual(old_ccache.decode('utf-8'), self.realm.ccache)
+
+            cred_resp = gb.acquire_cred(usage='initiate').creds
+
+            princ_name = gb.inquire_cred(cred_resp, name=True).name
+            name = gb.display_name(princ_name, name_type=False).name
+            self.assertEqual(name, self.realm.user_princ.encode('utf-8'))
+
+            if provider != 'heimdal':
+                changed_ccache = gb.krb5_ccache_name(old_ccache)
+                self.assertEqual(changed_ccache.decode('utf-8'), new_ccache)
+
+        finally:
+            # Ensure original behaviour is back for other tests
+            gb.krb5_ccache_name(None)
+
+        target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                     gb.NameType.hostbased_service)
+        client_resp = gb.init_sec_context(target_name, creds=cred_resp)
+        client_ctx = client_resp[0]
+        client_token = client_resp[3]
+
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name)[0]
+        server_resp = gb.accept_sec_context(client_token,
+                                            acceptor_creds=server_creds)
+        server_ctx = server_resp[0]
+        server_token = server_resp[3]
+
+        gb.init_sec_context(target_name, context=client_ctx,
+                            input_token=server_token)
+        initiator = gb.inquire_context(server_ctx,
+                                       initiator_name=True).initiator_name
+        initiator_name = gb.display_name(initiator, name_type=False).name
+
+        self.assertEqual(initiator_name, self.realm.user_princ.encode('utf-8'))
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    def test_krb5_export_lucid_sec_context(self):
+        target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                     gb.NameType.hostbased_service)
+        ctx_resp = gb.init_sec_context(target_name)
+
+        client_token1 = ctx_resp[3]
+        client_ctx = ctx_resp[0]
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name)[0]
+        server_resp = gb.accept_sec_context(client_token1,
+                                            acceptor_creds=server_creds)
+        server_ctx = server_resp[0]
+        server_tok = server_resp[3]
+
+        client_resp2 = gb.init_sec_context(target_name,
+                                           context=client_ctx,
+                                           input_token=server_tok)
+        ctx = client_resp2[0]
+
+        self.assertRaises(gb.GSSError, gb.krb5_export_lucid_sec_context,
+                          ctx, 0)
+
+        initiator_info = gb.krb5_export_lucid_sec_context(ctx, 1)
+        self.assertTrue(isinstance(initiator_info, gb.Krb5LucidContextV1))
+        self.assertEqual(initiator_info.version, 1)
+        self.assertTrue(initiator_info.is_initiator)
+        self.assertTrue(isinstance(initiator_info.endtime, int))
+        self.assertTrue(isinstance(initiator_info.send_seq, int))
+        self.assertTrue(isinstance(initiator_info.recv_seq, int))
+        self.assertEqual(initiator_info.protocol, 1)
+        self.assertEqual(initiator_info.rfc1964_kd, None)
+        self.assertTrue(isinstance(initiator_info.cfx_kd, gb.CfxKeyData))
+        self.assertTrue(isinstance(initiator_info.cfx_kd.ctx_key_type, int))
+        self.assertTrue(isinstance(initiator_info.cfx_kd.ctx_key, bytes))
+        self.assertTrue(isinstance(initiator_info.cfx_kd.acceptor_subkey_type,
+                                   int))
+        self.assertTrue(isinstance(initiator_info.cfx_kd.acceptor_subkey,
+                                   bytes))
+
+        acceptor_info = gb.krb5_export_lucid_sec_context(server_ctx, 1)
+        self.assertTrue(isinstance(acceptor_info, gb.Krb5LucidContextV1))
+        self.assertEqual(acceptor_info.version, 1)
+        self.assertFalse(acceptor_info.is_initiator)
+        self.assertTrue(isinstance(acceptor_info.endtime, int))
+        self.assertTrue(isinstance(acceptor_info.send_seq, int))
+        self.assertTrue(isinstance(acceptor_info.recv_seq, int))
+        self.assertEqual(acceptor_info.protocol, 1)
+        self.assertEqual(acceptor_info.rfc1964_kd, None)
+        self.assertTrue(isinstance(acceptor_info.cfx_kd, gb.CfxKeyData))
+        self.assertTrue(isinstance(acceptor_info.cfx_kd.ctx_key_type, int))
+        self.assertTrue(isinstance(acceptor_info.cfx_kd.ctx_key, bytes))
+        self.assertTrue(isinstance(acceptor_info.cfx_kd.acceptor_subkey_type,
+                                   int))
+        self.assertTrue(isinstance(acceptor_info.cfx_kd.acceptor_subkey,
+                                   bytes))
+
+        self.assertEqual(initiator_info.endtime, acceptor_info.endtime)
+        self.assertEqual(initiator_info.send_seq, acceptor_info.recv_seq)
+        self.assertEqual(initiator_info.recv_seq, acceptor_info.send_seq)
+        self.assertEqual(initiator_info.cfx_kd.ctx_key_type,
+                         acceptor_info.cfx_kd.ctx_key_type)
+        self.assertEqual(initiator_info.cfx_kd.ctx_key,
+                         acceptor_info.cfx_kd.ctx_key)
+        self.assertEqual(initiator_info.cfx_kd.acceptor_subkey_type,
+                         acceptor_info.cfx_kd.acceptor_subkey_type)
+        self.assertEqual(initiator_info.cfx_kd.acceptor_subkey,
+                         acceptor_info.cfx_kd.acceptor_subkey)
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    def test_krb5_extract_authtime_from_sec_context(self):
+        target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                     gb.NameType.hostbased_service)
+        ctx_resp = gb.init_sec_context(target_name)
+
+        client_token1 = ctx_resp[3]
+        client_ctx = ctx_resp[0]
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name)[0]
+        server_resp = gb.accept_sec_context(client_token1,
+                                            acceptor_creds=server_creds)
+        server_ctx = server_resp[0]
+        server_tok = server_resp[3]
+
+        client_resp2 = gb.init_sec_context(target_name,
+                                           context=client_ctx,
+                                           input_token=server_tok)
+        ctx = client_resp2[0]
+
+        if self.realm.provider.lower() == 'heimdal':
+            # Heimdal doesn't store the ticket info on the initiator
+            client_authtime = server_authtime = \
+                gb.krb5_extract_authtime_from_sec_context(server_ctx)
+            self.assertRaises(gb.GSSError,
+                              gb.krb5_extract_authtime_from_sec_context,
+                              client_ctx)
+        else:
+            client_authtime = gb.krb5_extract_authtime_from_sec_context(ctx)
+            server_authtime = gb.krb5_extract_authtime_from_sec_context(
+                server_ctx)
+
+        self.assertTrue(isinstance(client_authtime, int))
+        self.assertTrue(isinstance(server_authtime, int))
+        self.assertEqual(client_authtime, server_authtime)
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    def test_krb5_extract_authz_data_from_sec_context(self):
+        target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                     gb.NameType.hostbased_service)
+        client_token = gb.init_sec_context(target_name)[3]
+
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name)[0]
+        server_ctx = gb.accept_sec_context(client_token,
+                                           acceptor_creds=server_creds)[0]
+
+        # KRB5_AUTHDATA_IF_RELEVANT = 1
+        authz_data = gb.krb5_extract_authz_data_from_sec_context(server_ctx, 1)
+        self.assertTrue(isinstance(authz_data, bytes))
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    def test_krb5_import_cred(self):
+        # Ensuring we match the krb5 library to the GSSAPI library is a thorny
+        # problem.  Avoid it by requiring test suite users to explicitly
+        # enable this test.
+        if not self.KRB5_LIB_PATH:
+            self.skipTest("Env var GSSAPI_KRB5_MAIN_LIB not defined")
+
+        creds = gb.Creds()
+
+        # Should fail if only creds are specified
+        self.assertRaises(ValueError, gb.krb5_import_cred, creds)
+
+        new_ccache = os.path.join(self.realm.tmpdir, 'ccache-new')
+        new_env = self.realm.env.copy()
+        new_env['KRB5CCNAME'] = new_ccache
+        self.realm.kinit(self.realm.user_princ,
+                         password=self.realm.password('user'),
+                         env=new_env)
+
+        krb5 = ctypes.CDLL(self.KRB5_LIB_PATH)
+        krb5_ctx = ctypes.c_void_p()
+        krb5.krb5_init_context(ctypes.byref(krb5_ctx))
+        try:
+            ccache_ptr = ctypes.c_void_p()
+            err = krb5.krb5_cc_resolve(krb5_ctx, new_ccache.encode('utf-8'),
+                                       ctypes.byref(ccache_ptr))
+            self.assertEqual(err, 0)
+
+            try:
+                gb.krb5_import_cred(creds, cache=ccache_ptr.value)
+
+                # Creds will be invalid once the cc is closed so do this now
+                target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                             gb.NameType.hostbased_service)
+                client_resp = gb.init_sec_context(target_name, creds=creds)
+
+            finally:
+                krb5.krb5_cc_close(krb5_ctx, ccache_ptr)
+        finally:
+            krb5.krb5_free_context(krb5_ctx)
+
+        client_ctx = client_resp[0]
+        client_token = client_resp[3]
+
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name)[0]
+        server_resp = gb.accept_sec_context(client_token,
+                                            acceptor_creds=server_creds)
+        server_ctx = server_resp[0]
+        server_token = server_resp[3]
+
+        gb.init_sec_context(target_name, context=client_ctx,
+                            input_token=server_token)
+        initiator = gb.inquire_context(server_ctx,
+                                       initiator_name=True).initiator_name
+        initiator_name = gb.display_name(initiator, name_type=False).name
+
+        self.assertEqual(initiator_name, self.realm.user_princ.encode('utf-8'))
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    def test_krb5_get_tkt_flags(self):
+        target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                     gb.NameType.hostbased_service)
+        ctx_resp = gb.init_sec_context(target_name)
+
+        client_token1 = ctx_resp[3]
+        client_ctx = ctx_resp[0]
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name)[0]
+        server_resp = gb.accept_sec_context(client_token1,
+                                            acceptor_creds=server_creds)
+        server_ctx = server_resp[0]
+        server_tok = server_resp[3]
+
+        client_resp2 = gb.init_sec_context(target_name,
+                                           context=client_ctx,
+                                           input_token=server_tok)
+        client_ctx = client_resp2[0]
+
+        if self.realm.provider.lower() == 'heimdal':
+            # Heimdal doesn't store the ticket info on the initiator
+            client_flags = server_flags = gb.krb5_get_tkt_flags(server_ctx)
+            self.assertRaises(gb.GSSError, gb.krb5_get_tkt_flags, client_ctx)
+        else:
+            client_flags = gb.krb5_get_tkt_flags(client_ctx)
+            server_flags = gb.krb5_get_tkt_flags(server_ctx)
+
+        self.assertTrue(isinstance(client_flags, int))
+        self.assertTrue(isinstance(server_flags, int))
+        self.assertEqual(client_flags, server_flags)
+
+    @ktu.gssapi_extension_test('krb5', 'Kerberos Extensions')
+    @ktu.krb_provider_test(['mit'], 'Cannot revert ccache on Heimdal')
+    # https://github.com/heimdal/heimdal/issues/803
+    def test_krb5_set_allowable_enctypes(self):
+        krb5_mech = gb.OID.from_int_seq("1.2.840.113554.1.2.2")
+        AES_128 = 0x11
+        AES_256 = 0x12
+
+        new_ccache = os.path.join(self.realm.tmpdir, 'ccache-new')
+        new_env = self.realm.env.copy()
+        new_env['KRB5CCNAME'] = new_ccache
+        self.realm.kinit(self.realm.user_princ,
+                         password=self.realm.password('user'),
+                         env=new_env)
+
+        gb.krb5_ccache_name(new_ccache.encode('utf-8'))
+        try:
+            creds = gb.acquire_cred(usage='initiate',
+                                    mechs=[krb5_mech]).creds
+        finally:
+            gb.krb5_ccache_name(None)
+
+        gb.krb5_set_allowable_enctypes(creds, [AES_128])
+
+        target_name = gb.import_name(TARGET_SERVICE_NAME,
+                                     gb.NameType.hostbased_service)
+        server_name = gb.import_name(SERVICE_PRINCIPAL,
+                                     gb.NameType.kerberos_principal)
+        server_creds = gb.acquire_cred(server_name, usage='accept',
+                                       mechs=[krb5_mech])[0]
+
+        if self.realm.provider.lower() != 'heimdal':
+            # Will fail because the client only offers AES128
+            # Only seems to work on MIT and not Heimdal
+            ctx_resp = gb.init_sec_context(target_name, creds=creds)
+            client_token1 = ctx_resp[3]
+            client_ctx = ctx_resp[0]
+            gb.krb5_set_allowable_enctypes(server_creds, [AES_256])
+            self.assertRaises(gb.GSSError, gb.accept_sec_context,
+                              client_token1, acceptor_creds=server_creds)
+
+            gb.krb5_set_allowable_enctypes(server_creds, [AES_128, AES_256])
+
+        ctx_resp = gb.init_sec_context(target_name, creds=creds)
+        client_token1 = ctx_resp[3]
+        client_ctx = ctx_resp[0]
+
+        server_resp = gb.accept_sec_context(client_token1,
+                                            acceptor_creds=server_creds)
+        server_ctx = server_resp[0]
+        server_tok = server_resp[3]
+
+        client_resp2 = gb.init_sec_context(target_name,
+                                           context=client_ctx,
+                                           input_token=server_tok)
+        ctx = client_resp2[0]
+
+        initiator_info = gb.krb5_export_lucid_sec_context(ctx, 1)
+        acceptor_info = gb.krb5_export_lucid_sec_context(server_ctx, 1)
+        self.assertEqual(AES_128, initiator_info.cfx_kd.ctx_key_type)
+        self.assertEqual(initiator_info.cfx_kd.ctx_key_type,
+                         initiator_info.cfx_kd.acceptor_subkey_type)
+        self.assertEqual(acceptor_info.cfx_kd.ctx_key_type,
+                         acceptor_info.cfx_kd.acceptor_subkey_type)
 
 
 class TestIntEnumFlagSet(unittest.TestCase):
@@ -1064,7 +1467,8 @@ class TestInitContext(_GSSAPIKerberosTestCase):
         self.assertIsInstance(ctx, gb.SecurityContext)
         self.assertEqual(out_mech_type, gb.MechType.kerberos)
         self.assertIsInstance(out_req_flags, Set)
-        self.assertGreaterEqual(len(out_req_flags), 2)
+        if sys.platform != 'darwin':
+            self.assertGreaterEqual(len(out_req_flags), 2)
         self.assertGreater(len(out_token), 0)
         self.assertGreater(out_ttl, 0)
         self.assertIsInstance(cont_needed, bool)
@@ -1161,6 +1565,9 @@ class TestAcceptContext(_GSSAPIKerberosTestCase):
         self.server_ctx = server_resp.context
 
     def test_bad_channel_binding_raises_error(self):
+        if sys.platform == 'darwin':
+            self.skipTest('macOS does not raise error with validation')
+
         bdgs = gb.ChannelBindings(application_data=b'abcxyz',
                                   initiator_address_type=gb.AddressType.ip,
                                   initiator_address=b'127.0.0.1',
@@ -1304,7 +1711,7 @@ class TestWrapUnwrap(_GSSAPIKerberosTestCase):
         self.assertEqual(init_message[2].value, init_data)
         self.assertEqual(init_message[3].value, init_other_data)
 
-    @ktu.gssapi_extension_test('dce', 'DCE (IOV/AEAD)')
+    @ktu.gssapi_extension_test('dce', 'DCE (IOV)')
     def test_basic_iov_wrap_unwrap_autoalloc(self):
         init_data = b'some encrypted data'
         init_other_data = b'some other encrypted data'
@@ -1334,7 +1741,8 @@ class TestWrapUnwrap(_GSSAPIKerberosTestCase):
         self.assertEqual(init_message[2].value, init_data)
         self.assertEqual(init_message[3].value, init_other_data)
 
-    @ktu.gssapi_extension_test('dce', 'DCE (IOV/AEAD)')
+    @ktu.gssapi_extension_test('dce_aead', 'DCE (AEAD)')
+    @ktu.krb_provider_test(['mit'], 'unwrapping AEAD stream')
     def test_basic_aead_wrap_unwrap(self):
         assoc_data = b'some sig data'
         wrapped_message, conf = gb.wrap_aead(self.client_ctx, b"test message",
@@ -1353,7 +1761,8 @@ class TestWrapUnwrap(_GSSAPIKerberosTestCase):
         self.assertIsInstance(qop, int)
         self.assertGreaterEqual(qop, 0)
 
-    @ktu.gssapi_extension_test('dce', 'DCE (IOV/AEAD)')
+    @ktu.gssapi_extension_test('dce_aead', 'DCE (AEAD)')
+    @ktu.krb_provider_test(['mit'], 'unwrapping AEAD stream')
     def test_basic_aead_wrap_unwrap_no_assoc(self):
         wrapped_message, conf = gb.wrap_aead(self.client_ctx, b"test message")
         self.assertIsInstance(wrapped_message, bytes)
@@ -1370,7 +1779,8 @@ class TestWrapUnwrap(_GSSAPIKerberosTestCase):
         self.assertIsInstance(qop, int)
         self.assertGreaterEqual(qop, 0)
 
-    @ktu.gssapi_extension_test('dce', 'DCE (IOV/AEAD)')
+    @ktu.gssapi_extension_test('dce_aead', 'DCE (AEAD)')
+    @ktu.krb_provider_test(['mit'], 'unwrapping AEAD stream')
     def test_basic_aead_wrap_unwrap_bad_assoc_raises_error(self):
         assoc_data = b'some sig data'
         wrapped_message, conf = gb.wrap_aead(self.client_ctx, b"test message",
