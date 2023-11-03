@@ -36,19 +36,18 @@ Basic
 
 * a C compiler (such as GCC)
 
-* Python 3.6+ (older releases support older versions, but are unsupported)
+* Python 3.7+ (older releases support older versions, but are unsupported)
 
 * the `decorator` python package
 
 Compiling from Scratch
 ----------------------
 
-To compile from scratch, you will need Cython >= 0.21.1.
+To compile from scratch, you will need Cython >= 0.29.29 which is automatically
+installed by pip in an isolated build virtual environment.
 
 For Running the Tests
 ---------------------
-
-* the `nose` package
 
 * the `k5test` package
 
@@ -76,8 +75,7 @@ After being sure to install all the requirements,
 .. code-block:: bash
 
     $ git clone https://github.com/pythongssapi/python-gssapi.git
-    $ python setup.py build
-    $ python setup.py install
+    $ pip install .
 
 Tests
 =====
@@ -143,9 +141,13 @@ Extensions
 
 In addition to RFC 2743/2744, Python-GSSAPI also has support for:
 
+* RFC 4178 (GSS-API Negotiation Mechanism)
+
 * RFC 5587 (Extended GSS Mechanism Inquiry APIs)
 
 * RFC 5588 (GSS-API Extension for Storing Delegated Credentials)
+
+* RFC 5801 (GSS-API SASL Extensions)
 
 * (Additional) Credential Store Extension
 
@@ -161,13 +163,16 @@ In addition to RFC 2743/2744, Python-GSSAPI also has support for:
 
 * GGF Extensions
 
+* Kerberos specific extensions
+
 The Team
 ========
 
 (GitHub usernames in parentheses)
 
-* Robbie Harwood (@frozencemetery) - current maintainer and developer
+* Jordan Borean (@jborean93) - current maintainer and developer
 * Simo Sorce (@simo5) - developer
+* Robbie Harwood (@frozencemetery) - author emeritus
 * Solly Ross (@directxman12) - author emeritus
 * Hugh Cole-Baker (@sigmaris) - author emeritus
 
@@ -176,5 +181,5 @@ Get Involved
 
 We welcome new contributions in the form of Issues and Pull Requests on
 Github.  If you would like to join our discussions, you can find us on
-`Freenode <https://webchat.freenode.net/>`_ IRC, channel `#python-gssapi
-<irc://freenode.net/python-gssapi>`_.
+`libera.chat <https://libera.chat/>`_ IRC, channel `#python-gssapi
+<irc://libera.chat/python-gssapi>`_.

@@ -1,10 +1,4 @@
 #!/usr/bin/env python
-from __future__ import print_function
-
-from setuptools import setup
-from setuptools import Distribution
-from setuptools.command.sdist import sdist
-from setuptools.extension import Extension
 import subprocess
 import platform
 import re
@@ -13,21 +7,15 @@ import os
 import shutil
 import shlex
 
+# Enables the vendored distutils in setuptools over the stdlib one to avoid
+# the deprecation warning. Must be done before importing setuptools,
+# setuptools also must be imported before distutils.
+# https://github.com/pypa/setuptools/blob/main/docs/deprecated/distutils-legacy.rst
+os.environ['SETUPTOOLS_USE_DISTUTILS'] = 'local'
 
-SKIP_CYTHON_FILE = '__dont_use_cython__.txt'
-
-if os.path.exists(SKIP_CYTHON_FILE):
-    print("In distributed package, building from C files...", file=sys.stderr)
-    SOURCE_EXT = 'c'
-else:
-    try:
-        from Cython.Build import cythonize
-        print("Building from Cython files...", file=sys.stderr)
-        SOURCE_EXT = 'pyx'
-    except ImportError:
-        print("Cython not found, building from C files...",
-              file=sys.stderr)
-        SOURCE_EXT = 'c'
+from setuptools import setup  # noqa: E402
+from setuptools.extension import Extension  # noqa: E402
+from Cython.Build import cythonize  # noqa: E402
 
 
 def get_output(*args, **kwargs):
@@ -38,7 +26,19 @@ def get_output(*args, **kwargs):
 
 # get the compile and link args
 kc = "krb5-config"
+autodetect_kc = True
 posix = os.name != 'nt'
+
+# Per https://docs.python.org/3/library/platform.html#platform.architecture
+# this is the preferred way of determining "64-bitness".
+is64bit = sys.maxsize > 2**32
+
+kc_env = 'GSSAPI_KRB5CONFIG'
+if kc_env in os.environ:
+    kc = os.environ[kc_env]
+    autodetect_kc = False
+    print(f"Using {kc} from env")
+
 link_args, compile_args = [
     shlex.split(os.environ[e], posix=posix) if e in os.environ else None
     for e in ['GSSAPI_LINKER_ARGS', 'GSSAPI_COMPILER_ARGS']
@@ -72,7 +72,7 @@ if os.name == 'nt':
     except ValueError:
         cygwinccompiler.get_msvcr = lambda *a, **kw: []
 
-if sys.platform.startswith("freebsd"):
+if sys.platform.startswith("freebsd") and autodetect_kc:
     # FreeBSD does $PATH backward, for our purposes.  That is, the package
     # manager's version of the software is in /usr/local, which is in PATH
     # *after* the version in /usr.  We prefer the package manager's version
@@ -97,7 +97,7 @@ if link_args is None:
         link_args = ['-framework', 'GSS']
     elif winkrb_path:
         _libs = os.path.join(
-            winkrb_path, 'lib', 'amd64' if sys.maxsize > 2 ** 32 else 'i386'
+            winkrb_path, 'lib', 'amd64' if is64bit else 'i386'
         )
         link_args = (
             ['-L%s' % _libs]
@@ -110,12 +110,13 @@ if link_args is None:
 
 if compile_args is None:
     if osx_has_gss_framework:
-        compile_args = ['-framework', 'GSS', '-DOSX_HAS_GSS_FRAMEWORK']
+        compile_args = ['-DOSX_HAS_GSS_FRAMEWORK']
     elif winkrb_path:
         compile_args = [
             '-I%s' % os.path.join(winkrb_path, 'include'),
-            '-DMS_WIN64'
         ]
+        if is64bit:
+            compile_args.append('-DMS_WIN64')
     elif os.environ.get('MINGW_PREFIX'):
         compile_args = ['-fPIC']
     else:
@@ -174,10 +175,7 @@ if ENABLE_SUPPORT_DETECTION:
         main_lib = os.environ.get('MINGW_PREFIX')+'/bin/libgss-3.dll'
     elif sys.platform == 'msys':
         # Plain msys, not running in MINGW_PREFIX. Try to get the lib from one
-        _main_lib = (
-            '/mingw%d/bin/libgss-3.dll'
-            % (64 if sys.maxsize > 2 ** 32 else 32)
-        )
+        _main_lib = f'/mingw{64 if is64bit else 32}/bin/libgss-3.dll'
         if os.path.exists(_main_lib):
             main_lib = _main_lib
             os.environ['PATH'] += os.pathsep + os.path.dirname(main_lib)
@@ -208,60 +206,9 @@ if ENABLE_SUPPORT_DETECTION:
     GSSAPI_LIB = ctypes.CDLL(os.path.join(main_path, main_lib))
 
 
-# add in the flag that causes us not to compile from Cython when
-# installing from an sdist
-class sdist_gssapi(sdist):
-    def run(self):
-        if not self.dry_run:
-            with open(SKIP_CYTHON_FILE, 'w') as flag_file:
-                flag_file.write('COMPILE_FROM_C_ONLY')
-
-            sdist.run(self)
-
-            os.remove(SKIP_CYTHON_FILE)
-
-
-DONT_CYTHONIZE_FOR = ('clean',)
-
-
-class GSSAPIDistribution(Distribution, object):
-    def run_command(self, command):
-        self._last_run_command = command
-        Distribution.run_command(self, command)
-
-    @property
-    def ext_modules(self):
-        if SOURCE_EXT != 'pyx':
-            return getattr(self, '_ext_modules', None)
-
-        if getattr(self, '_ext_modules', None) is None:
-            return None
-
-        if getattr(self, '_last_run_command', None) in DONT_CYTHONIZE_FOR:
-            return self._ext_modules
-
-        if getattr(self, '_cythonized_ext_modules', None) is None:
-            self._cythonized_ext_modules = cythonize(
-                self._ext_modules,
-                language_level=2,
-            )
-
-        return self._cythonized_ext_modules
-
-    @ext_modules.setter
-    def ext_modules(self, mods):
-        self._cythonized_ext_modules = None
-        self._ext_modules = mods
-
-    @ext_modules.deleter
-    def ext_modules(self):
-        del self._ext_modules
-        del self._cythonized_ext_modules
-
-
 def make_extension(name_fmt, module, **kwargs):
     """Helper method to remove the repetition in extension declarations."""
-    source = name_fmt.replace('.', '/') % module + '.' + SOURCE_EXT
+    source = name_fmt.replace('.', '/') % module + '.pyx'
     if not os.path.exists(source):
         raise OSError(source)
     return Extension(
@@ -313,7 +260,7 @@ def gssapi_modules(lst):
     # add in any present enum extension files
     res.extend(ENUM_EXTS)
 
-    return res
+    return cythonize(res, language_level=2)
 
 
 long_desc = re.sub(r'\.\. role:: \w+\(code\)\s*\n\s*.+', '',
@@ -327,24 +274,29 @@ install_requires = [
 
 setup(
     name='gssapi',
-    version='1.6.12',
+    version='1.8.2',
     author='The Python GSSAPI Team',
-    author_email='rharwood@redhat.com',
+    author_email='jborean93@gmail.com',
     packages=['gssapi', 'gssapi.raw', 'gssapi.raw._enum_extensions',
               'gssapi.tests'],
+    package_data={
+        "gssapi": ["py.typed"],
+        "gssapi.raw": ["*.pyi"],
+    },
     description='Python GSSAPI Wrapper',
     long_description=long_desc,
     license='LICENSE.txt',
     url="https://github.com/pythongssapi/python-gssapi",
-    python_requires=">=3.6.*",
+    python_requires=">=3.7",
     classifiers=[
         'Development Status :: 5 - Production/Stable',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: ISC License (ISCL)',
         'Programming Language :: Python :: Implementation :: CPython',
@@ -352,8 +304,6 @@ setup(
         'Topic :: Security',
         'Topic :: Software Development :: Libraries :: Python Modules'
     ],
-    distclass=GSSAPIDistribution,
-    cmdclass={'sdist': sdist_gssapi},
     ext_modules=gssapi_modules([
         main_file('misc'),
         main_file('exceptions'),
@@ -372,7 +322,10 @@ setup(
         extension_file('rfc5588', 'gss_store_cred'),
         extension_file('rfc5801', 'gss_inquire_saslname_for_mech'),
         extension_file('cred_imp_exp', 'gss_import_cred'),
-        extension_file('dce', 'gss_wrap_iov'),
+        extension_file('dce',
+                       '__ApplePrivate_gss_wrap_iov' if osx_has_gss_framework
+                       else 'gss_wrap_iov'),
+        extension_file('dce_aead', 'gss_wrap_aead'),
         extension_file('iov_mic', 'gss_get_mic_iov'),
         extension_file('ggf', 'gss_inquire_sec_context_by_oid'),
         extension_file('set_cred_opt', 'gss_set_cred_option'),
@@ -384,6 +337,8 @@ setup(
         # see ext_password{,_add}.pyx for more information on this split
         extension_file('password', 'gss_acquire_cred_with_password'),
         extension_file('password_add', 'gss_add_cred_with_password'),
+
+        extension_file('krb5', 'gss_krb5_ccache_name'),
     ]),
     keywords=['gssapi', 'security'],
     install_requires=install_requires
