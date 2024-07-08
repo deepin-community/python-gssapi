@@ -1,3 +1,9 @@
+python-gssapi (1.8.2-1deepin1) unstable; urgency=medium
+
+  * No source change upload against python 3.12.
+
+ -- Tianyu Chen <sweetyfish@deepin.org>  Mon, 08 Jul 2024 09:55:07 +0200
+
 python-gssapi (1.8.2-1) unstable; urgency=medium
 
   * New upstream version 1.8.2
